@@ -1,0 +1,8 @@
+a1 = x + y 
+b = a1 + y 
+a2 = b + c 
+X1 = A + B 
+X2 = A + C 
+Y = X2 + A 
+Z = X2 - B 
+Q = B * Z 
