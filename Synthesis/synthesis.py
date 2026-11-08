@@ -14,6 +14,13 @@ try:
         ssa_algo = parser.ssa(algo)
         
         node_dict = dag.algo2tree(ssa_algo)
+        dag.schedule(node_dict, method="ASAP")
+
+        for node in node_dict.values():
+            print(node)
+
+        print("*****************************\n\n")
+        dag.schedule(node_dict, method="ALAP")
 
         for node in node_dict.values():
             print(node)
