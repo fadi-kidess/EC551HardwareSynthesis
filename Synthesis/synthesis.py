@@ -1,4 +1,5 @@
 from Parser import parser
+import dag
 import argparse
 from pathlib import Path
 arg = argparse.ArgumentParser(description="Read a text file from command line arguments.")
@@ -11,6 +12,12 @@ try:
         content = file
         algo = parser.parse(content)
         ssa_algo = parser.ssa(algo)
+        
+        node_dict = dag.algo2tree(ssa_algo)
+
+        for node in node_dict.values():
+            print(node)
+
         if(args.export_ssa):
             export = parser.export_ssa(ssa_algo)
             filename = Path(args.file_path).name
