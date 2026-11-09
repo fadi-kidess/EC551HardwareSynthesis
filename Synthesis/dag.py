@@ -12,11 +12,14 @@ Q = B * Z
 
 Generate a tree where nodes are operators, edges are variables
 """
+import copy
+from math import inf
 
 class Node:
 	def __init__(self, out, op, in1, in2):
 		self.op = op
 		self.children = [in1, in2]
+		self.parents = []
 		self.name = out
 		self.step = 0
 		self.depth = 0
@@ -63,7 +66,6 @@ def algo2tree(algorithm):
 
 		d1, d2 = 0, 0
 
-		depends = False
 		if in1 in node_dict.keys():
 			in1 = node_dict[in1]
 			d1 = in1.depth
@@ -74,15 +76,28 @@ def algo2tree(algorithm):
 		node = Node(out, op, in1, in2)
 		node.depth = max(d1, d2) + 1
 
+		if in1 in node_dict.values():
+			in1.parents.append(node)
+		if in2 in node_dict.values():
+			in2.parents.append(node)
+
 		node_dict[out] = node
 
+	# Only keep root nodes
 	for node in list(node_dict.values()):
 		if node.children[1] in node_dict.values():
 			del node_dict[node.children[1].name]
 		if node.children[0] in node_dict.values():
 			del node_dict[node.children[0].name]
 
+
 	return node_dict
+
+def find_upstream(node):
+	list_nodes = [node]
+	for parent in node.parents:
+		list_nodes.extend(find_upstream(parent))
+	return list_nodes	
 
 def traverse(root):
 	list_nodes = [root]
@@ -92,7 +107,7 @@ def traverse(root):
 		list_nodes.extend(traverse(root.children[1]))
 	return list_nodes
 
-def schedule(node_dict, method="ASAP"):
+def schedule(node_dict, method="ASAP", max_op=1):
 	if method == "ASAP":
 		return ASAP(node_dict)
 	elif method == "ALAP":
@@ -100,9 +115,9 @@ def schedule(node_dict, method="ASAP"):
 	elif method == "CUSTOM":
 		return CUSTOM(node_dict)
 	elif method == "ASAP_CONST":
-		return ASAP_const(node_dict)
+		return ASAP_const(node_dict, max_op)
 	elif method == "ALAP_CONST":
-		return ALAP_const(node_dict)
+		return ALAP_const(node_dict, max_op)
 	else:
 		raise ValueError(f"Unknown scheduling method: {method}")
 
@@ -113,7 +128,48 @@ def ASAP(node_dict):
 			el.step = el.depth
 	return
 
-def ASAP_const(node_dict):
+def ASAP_const(node_dict, maxop_per_step):
+	step_dict = {}
+
+	for node in node_dict.values():
+		tree = traverse(node)
+		for el in tree:
+			el.step = el.depth
+			if el.step in step_dict.keys():
+				if el not in step_dict[el.step]:
+					step_dict[el.step].append(el)
+			else:
+				step_dict[el.step] = [el]
+
+	column = sorted(step_dict.keys())[0]
+
+	while column <= sorted(step_dict.keys())[-1]:
+		# print("******************")
+		# for step in sorted(step_dict.keys()):
+		# 	print(f"\n Step: t{step}")
+		# 	for st_node in step_dict[step]:
+		# 		print(st_node.name)
+				
+		if column not in step_dict.keys():
+			column += 1
+			continue
+
+		if len(step_dict[column]) > maxop_per_step:
+
+			to_be_delayed = []
+			for extra in step_dict[column][maxop_per_step:]:
+				to_be_delayed.extend(find_upstream(extra))
+
+			for node in list(set(to_be_delayed)):
+				node.step += 1
+				step_dict[node.step-1].remove(node)
+
+				if (node.step) in step_dict.keys():
+					step_dict[node.step].append(node)
+				else:
+					step_dict[node.step] = [node]
+
+		column += 1	
 	pass
 
 def ALAP(node_dict):
@@ -142,7 +198,62 @@ def ALAP(node_dict):
 
 	return node_dict
 
-def ALAP_const(node_dict):
+def ALAP_const(node_dict, maxop_per_step):
+	ASAP(node_dict)
+
+	step_dict = {}
+	min_step = inf
+
+	for node in node_dict.values():
+		tree = traverse(node)
+		for el in tree:
+			if el.step in step_dict.keys():
+				if el not in step_dict[el.step]:
+					step_dict[el.step].append(el)
+			else:
+				step_dict[el.step] = [el]
+
+	column = sorted(step_dict.keys())[-1]
+
+	while column >= sorted(step_dict.keys())[0]:
+		# print("******************")
+		# for step in sorted(step_dict.keys()):
+		# 	print(f"\n Step: t{step}")
+		# 	for st_node in step_dict[step]:
+		# 		print(st_node.name)
+				
+		if column not in step_dict.keys():
+			column -= 1
+			continue
+
+		if len(step_dict[column]) > maxop_per_step:
+
+			to_be_hastened = []
+			for extra in step_dict[column][maxop_per_step:]:
+				to_be_hastened.extend(traverse(extra))
+				# print(f"\tColumn {column}, node {extra.name}")
+				# for name in to_be_hastened:
+				# 	print("\t" + name.name)
+
+			for node in list(set(to_be_hastened)):
+				# print(f"Hastening: {node.name}, step: {node.step}")
+				node.step -= 1
+				min_step = min(min_step, node.step)
+
+				step_dict[node.step+1].remove(node)
+				if (node.step) in step_dict.keys():
+					step_dict[node.step].append(node)
+				else:
+					step_dict[node.step] = [node]
+
+		column -= 1
+
+	all_nodes = []
+	for node in node_dict.values():
+		all_nodes.extend(traverse(node))
+
+	for node in list(set(all_nodes)):
+		node.step -= min_step - 1
 	pass
 
 def CUSTOM(node_dict):
