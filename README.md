@@ -11,11 +11,16 @@ o Your complete 30-minute demo plan.
 ├── README.md						<- This File
 └── Synthesis						<- Project Root
     ├── Inputs						<- Input files (lists of equations)
-    │   └── input_1.txt
+    │   └── <input>.txt
     │
 	├── Outputs						<- Output files
-    │   └── SSA						<- Single Static Assignment files
-    │       └── input_1_ssa.txt
+    │   ├── SSA						<- Single Static Assignment files
+    │   │   └── <input>_ssa.txt
+    │	│
+    │   └── RTL						<- Datapath outputs
+    │       ├── <input>_datapath.v
+    │       ├── tb_<input>_datapath.v
+    │       └── <input>_datapath_report.txt
     │
 	├── Parser						<- <in>.txt to algo. (list of steps)
     │   └── parser.py				
@@ -26,7 +31,10 @@ o Your complete 30-minute demo plan.
     │   └── subtractor.v
     │
 	├── dag.py						<- algo. to DAG graph w\schedulers
-    └── synthesis.py				<- main func. (implements CLI tool)
+	│
+    ├── datapath_gen.py				<- DAG. to datapth
+	│
+	└── synthesis.py				<- main func. (implements CLI tool)
 ```
 
 ## Tool Architecture
