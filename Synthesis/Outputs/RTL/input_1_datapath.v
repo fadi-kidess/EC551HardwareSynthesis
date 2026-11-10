@@ -22,6 +22,8 @@ module input_1_datapath #(
     output wire [WIDTH-1:0] out_X,
     output wire             busy,
     output wire             done
+    input wire [2-1:0] function_probe_sel,
+    output wire [WIDTH-1:0] function_probe
 );
 
     localparam LAT_ADD = 1;
@@ -124,6 +126,14 @@ module input_1_datapath #(
     subtractor #(.WIDTH(WIDTH), .NUM_PIPE_CYCLES(LAT_SUB)) u_sub0 (
         .clk(clk), .a(sub0_a), .b(sub0_b), .out(sub0_out));
 
+    always @(*) begin
+        case (function_probe)
+            2'd0: function_probe = add0_out;
+            2'd1: function_probe = mul0_out;
+            2'd2: function_probe = sub0_out;
+            default: function_probe = sub0_out;
+        endcase
+    end
     // ------------------------------------------------------------ registers
     // r0 holds: C, X2
     reg  [WIDTH-1:0] r0_d;
