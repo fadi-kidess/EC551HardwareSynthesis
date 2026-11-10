@@ -16,7 +16,7 @@ module multiplier #(
 
     always @(posedge clk) begin
         if (NUM_PIPE_CYCLES > 0) begin
-            pipe_regs[0] <= data_in;
+            pipe_regs[0] <= a*b;
             for (i = 1; i < NUM_PIPE_CYCLES; i = i + 1) begin
                 pipe_regs[i] <= pipe_regs[i-1];
             end

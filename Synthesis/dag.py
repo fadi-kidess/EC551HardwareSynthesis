@@ -106,14 +106,26 @@ def traverse(root):
 	if isinstance(root.children[1], Node):
 		list_nodes.extend(traverse(root.children[1]))
 	return list_nodes
-
-def schedule(node_dict, method="ASAP", max_op=1):
+def collect_nodes(node_dict):
+	seen, order = set(), []
+	def visit(n):
+		if id(n) in seen:
+			return
+		seen.add(id(n))
+		for child in n.children:
+			if isinstance(child, Node):
+				visit(child)
+		order.append(n)
+	for root in node_dict.values():
+		visit(root)
+	return order
+def schedule(node_dict, method="ASAP", max_op=1, max_ops=None, latency=None):
 	if method == "ASAP":
 		return ASAP(node_dict)
 	elif method == "ALAP":
 		return ALAP(node_dict)
 	elif method == "CUSTOM":
-		return CUSTOM(node_dict)
+		return CUSTOM(node_dict, max_ops=max_ops, latency=latency)
 	elif method == "ASAP_CONST":
 		return ASAP_const(node_dict, max_op)
 	elif method == "ALAP_CONST":
@@ -256,5 +268,46 @@ def ALAP_const(node_dict, maxop_per_step):
 		node.step -= min_step - 1
 	pass
 
-def CUSTOM(node_dict):
-	pass
+def CUSTOM(node_dict, max_ops=None, latency=None):
+	max_ops = dict(max_ops or {})
+	latency = dict(latency or {})
+	nodes = collect_nodes(node_dict)
+ 
+	def lat(n):
+		return latency.get(n.op, 1)
+	def ready_delay(n):      # steps after issue before a consumer may issue
+		return max(lat(n), 1)
+ 
+	for op in {n.op for n in nodes}:
+		if max_ops.get(op, inf) < 1:
+			raise ValueError(f"max_ops['{op}'] must be >= 1: the program uses '{op}'")
+ 
+	# Priority: longest path (in steps) from this op to the end of the schedule.
+	# Reverse topological order guarantees every consumer is done first.
+	in_graph = {id(n) for n in nodes}
+	prio = {}
+	for n in reversed(nodes):
+		tail = max((prio[id(p)] for p in n.parents if id(p) in in_graph), default=0)
+		prio[id(n)] = ready_delay(n) + tail
+ 
+	unscheduled = set(id(n) for n in nodes)
+	t = 1
+	while unscheduled:
+		candidates = []
+		for n in nodes:
+			if id(n) not in unscheduled:
+				continue
+			preds = [c for c in n.children if isinstance(c, Node)]
+			if all(id(c) not in unscheduled and c.step + ready_delay(c) <= t for c in preds):
+				candidates.append(n)
+		candidates.sort(key=lambda n: (-prio[id(n)], n.depth, n.name))
+ 
+		used = {}
+		for n in candidates:
+			k = used.get(n.op, 0)
+			if k < max_ops.get(n.op, inf):
+				n.step, n.unit, n.latency = t, k, lat(n)
+				used[n.op] = k + 1
+				unscheduled.discard(id(n))
+		t += 1
+	return node_dict

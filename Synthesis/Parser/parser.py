@@ -4,6 +4,9 @@ import copy
 def parse(text):
     algorithm = []
     for line in text:
+        line = line.split('#')[0].strip()   # allow blank lines and '#' comments
+        if not line:
+            continue
         # A step in the algorithm is the output, an input, an operation, and the second input.
         step = ['','','', '']
         out,after = line.split('=')[0].strip(), line.split('=')[1].strip()
@@ -36,6 +39,11 @@ def ssa(algo):
             if(outs_count[element_idx] > 1):
                 ssa_algo[i][1] = f'{ssa_algo[i][1]}{outs_current[element_idx]}'
         if(ssa_algo[i][3] in outs_set):
+            for k in (1, 3):
+                if(ssa_algo[i][k] in outs_set):
+                    element_idx = outs_set.index(ssa_algo[i][k])
+                    if(outs_count[element_idx] > 1 and outs_current[element_idx] > 0):
+                        ssa_algo[i][k] = f'{ssa_algo[i][k]}{outs_current[element_idx]}'
             element_idx = outs_set.index(ssa_algo[i][3])
             if(outs_count[element_idx] > 1):
                 ssa_algo[i][3] = f'{ssa_algo[i][3]}{outs_current[element_idx]}'
