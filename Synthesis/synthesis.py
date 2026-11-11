@@ -21,11 +21,13 @@ arg.add_argument("--rtl-dir", type=str, default="Outputs/RTL", help="Where to wr
 arg.add_argument("--top", type=str, default=None, help="Top module name (default: <input>_datapath)")
 arg.add_argument("--width", type=int, default=32, help="Datapath width")
 arg.add_argument("--fpga", action='store_true',
-                 help="Also generate <top>_fpga.v: board wrapper with debouncers, step mode and "
+                 help="Generate the RTL (implies --rtl) plus the board top <top>.v, which wraps <top>_core.v with debouncers, step mode and "
                       "seven-segment display (instantiates debouncer.v and seven_seg.v)")
 arg.add_argument("--outputs", type=str, default=None,
                  help="Comma-separated variables to expose as outputs (default: every assigned variable)")
 args = arg.parse_args()
+if args.fpga:
+    args.rtl = True          # the board top is built from the generated datapath
 
 max_ops = {'+': args.max_add, '-': args.max_sub, '*': args.max_mul}
 latency = {'+': args.lat_add, '-': args.lat_sub, '*': args.lat_mul}

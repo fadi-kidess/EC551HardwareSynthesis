@@ -1,16 +1,16 @@
-Datapath report: input_1_datapath
+Datapath report: input_1_datapath_core
 ============================================================
 
-Latency (NUM_PIPE_CYCLES): adder=1, subtractor=1, multiplier=1
-Control steps: 1..4   total latency start->done: 5 cycles
+Latency (NUM_PIPE_CYCLES): adder=3, subtractor=3, multiplier=3
+Control steps: 1..10   total latency start->done: 11 cycles
 Dead code removed (never reaches an output): a1, b, a2, X1
 
 Schedule / binding
 ------------------------------------------------------------
-  step  1  add0      X2 = A + C          result @ step 2   -> r0
-  step  2  add0       Y = X2 + A         result @ step 3   -> r1
-  step  2  sub0       Z = X2 - B         result @ step 3   -> r2
-  step  3  mul0       Q = B * Z          result @ step 4   -> r3
+  step  1  add0      X2 = A + C          result @ step 4   -> r0
+  step  4  add0       Y = X2 + A         result @ step 7   -> r1
+  step  4  sub0       Z = X2 - B         result @ step 7   -> r2
+  step  7  mul0       Q = B * Z          result @ step 10  -> r3
 
 Functional units
 ------------------------------------------------------------
@@ -20,10 +20,10 @@ Functional units
 
 Registers (left-edge allocation; lifetime = steps the value must be held)
 ------------------------------------------------------------
-  r0   input mux 2:1   C[1..1], X2[3..end]
-  r1   input mux 2:1   A[1..2], Y[4..end]
-  r2   input mux 2:1   B[1..3], Z[4..end]
-  r3   input mux 1:1   Q[5..end]
+  r0   input mux 2:1   C[1..1], X2[5..end]
+  r1   input mux 2:1   A[1..4], Y[8..end]
+  r2   input mux 2:1   B[1..7], Z[8..end]
+  r3   input mux 1:1   Q[11..end]
   total: 4 registers for 7 stored values
 
 Outputs
@@ -38,6 +38,15 @@ Usage per step
   step | add0  | mul0  | sub0  | writes
      0 |       |       |       | r0<-C, r1<-A, r2<-B
      1 |  X2   |       |       | 
-     2 |   Y   |       |   Z   | r0<-X2
-     3 |       |   Q   |       | r1<-Y, r2<-Z
-     4 |       |       |       | r3<-Q
+     2 |       |       |       | 
+     3 |       |       |       | 
+     4 |   Y   |       |   Z   | r0<-X2
+     5 |       |       |       | 
+     6 |       |       |       | 
+     7 |       |   Q   |       | r1<-Y, r2<-Z
+     8 |       |       |       | 
+     9 |       |       |       | 
+    10 |       |       |       | r3<-Q
+
+Switches: in_A=sw[3:0], in_C=sw[7:4], in_B=sw[11:8], function_probe_sel=sw[14:13], step_switch=sw[15]
+FPGA top module: input_1_datapath. Board files needed: debouncer.v, seven_seg.v, clk_divider.v, counter_3bit_sync_reset.v
