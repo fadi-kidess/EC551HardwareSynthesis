@@ -1,30 +1,62 @@
+"""
+Datapath + FSM generator.
+
+Takes a scheduled DAG (dag.CUSTOM sets node.step / node.unit / node.latency) and emits:
+  * <top>.v       the datapath: functional-unit instances, operand muxes, registers with
+                  input muxes, and the FSM controller that drives every select/enable
+  * tb_<top>.v    a self-checking testbench whose reference model is the ORIGINAL
+                  (pre-SSA) program, executed sequentially
+  * <top>_report.txt  schedule, binding, register lifetimes, mux sizes, control table
+
+Timing model (matches adder.v / subtractor.v / multiplier.v):
+  - An op issued in control step s drives its unit's a/b inputs during step s.
+  - With NUM_PIPE_CYCLES = L >= 1 the result is on the unit's `out` during step s+L only
+    (the pipeline keeps shifting). A consumer issued in exactly step s+L reads `out`
+    directly (bypass); anything later reads a register loaded at the end of step s+L.
+  - With L = 0 the unit is combinational; the result is registered at the end of step s
+    and consumers start at s+1 (no operation chaining).
+  - `ce` (clock enable) freezes the FSM, every register and every unit pipeline together,
+    so holding ce low is exactly equivalent to stopping the clock (used for single-step).
+  - Step 0 is IDLE: when `start` is high, primary inputs are latched into registers.
+    Inputs may change once `start` has been sampled. Outputs are valid when `done` is
+    high and stay valid until the next `start`.
+
+Registers are shared between values whose lifetimes do not overlap (left-edge
+algorithm); a value read only through the bypass gets no register at all.
+"""
 import math
 import re
- 
+
 from dag import Node, collect_nodes
- 
+
 FU_TYPES = {
     '+': {'module': 'adder',      'prefix': 'add', 'commutative': True},
     '-': {'module': 'subtractor', 'prefix': 'sub', 'commutative': False},
     '*': {'module': 'multiplier', 'prefix': 'mul', 'commutative': True},
 }
 CONST_RE = re.compile(r'^\d+$')
- 
- 
+
+
 def is_const(x):
     return isinstance(x, str) and bool(CONST_RE.match(x))
- 
- 
+
+
 def ident(name):
     s = re.sub(r'\W', '_', name)
     return s if not s[0].isdigit() else '_' + s
- 
- 
+
+
 def clog2(n):
     return max(1, math.ceil(math.log2(n))) if n > 1 else 1
- 
- 
+
+
+# --------------------------------------------------------------------------- DCE
 def dead_code_eliminate(algo, ssa_algo, outputs=None):
+    """
+    Program outputs are the final definition of each assigned variable (or only the ones
+    named in `outputs`). Steps that cannot reach an output are dropped.
+    Returns (live_ssa_algo, {original_name: ssa_name}, [removed ssa names]).
+    """
     final = {}
     for orig, step in zip(algo, ssa_algo):
         final[orig[0]] = step[0]
@@ -33,40 +65,42 @@ def dead_code_eliminate(algo, ssa_algo, outputs=None):
         if missing:
             raise ValueError(f"--outputs names variables that are never assigned: {missing}")
         final = {o: final[o] for o in outputs}
- 
+
     live, keep = set(final.values()), []
-    for step in reversed(ssa_algo): 
+    for step in reversed(ssa_algo):          # reverse order resolves names correctly
         if step[0] in live:
             keep.append(step)
             live.update((step[1], step[3]))
     keep.reverse()
     removed = [s[0] for s in ssa_algo if s not in keep]
     return keep, final, removed
- 
 
+
+# --------------------------------------------------------------------------- model
 class Value:
+    """Anything that may need to live in a register: a primary input or an op result."""
     def __init__(self, kind, name, src, write_step):
-        self.kind = kind
+        self.kind = kind            # 'in' | 'op'
         self.name = name
-        self.src = src 
-        self.w = write_step 
-        self.reg_reads = []
+        self.src = src              # signal that is written into the register
+        self.w = write_step         # register (if any) is loaded at the END of this step
+        self.reg_reads = []         # steps in which a consumer reads it from a register
         self.is_output = False
         self.reg = None
- 
+
     @property
     def needs_reg(self):
         return self.is_output or bool(self.reg_reads)
- 
+
     @property
-    def start(self):
+    def start(self):                # first step the register holds this value
         return self.w + 1
- 
+
     @property
-    def end(self):
+    def end(self):                  # last step the register must hold it
         return math.inf if self.is_output else max(self.reg_reads)
- 
- 
+
+
 class Datapath:
     def __init__(self, node_dict, out_map, latency, width=32, top='datapath'):
         self.top, self.width = top, width
@@ -80,24 +114,26 @@ class Datapath:
         by_name = {n.name: n for n in self.nodes}
         self.out_map = out_map
         self.outputs = {o: by_name[s] for o, s in out_map.items()}
- 
+
         self._build_values()
         self._check_and_collect_reads()
         self._allocate_registers()
         self._bind_operands()
         self._build_register_writes()
- 
+
+    # ---- functional units ------------------------------------------------
     def unit_name(self, n):
         return f"{FU_TYPES[n.op]['prefix']}{n.unit}"
- 
+
     def units(self):
         seen = {}
         for n in self.nodes:
             seen[self.unit_name(n)] = n.op
         return sorted(seen.items(), key=lambda kv: kv[0])
- 
+
+    # ---- values and lifetimes -------------------------------------------
     def _build_values(self):
-        self.values = {} 
+        self.values = {}                     # key -> Value ; key is ('in', name) or id(node)
         for n in self.nodes:
             for c in n.children:
                 if isinstance(c, str) and not is_const(c) and ('in', c) not in self.values:
@@ -108,7 +144,7 @@ class Datapath:
         for n in self.outputs.values():
             self.values[id(n)].is_output = True
         self.inputs = [v for v in self.values.values() if v.kind == 'in']
- 
+
     def operand_source(self, child, step):
         """('const', literal) | ('fu', signal) | ('reg', Value)"""
         if is_const(child):
@@ -119,7 +155,7 @@ class Datapath:
         if self.latency[child.op] >= 1 and step == v.w:
             return ('fu', v.src)
         return ('reg', v)
- 
+
     def _check_and_collect_reads(self):
         for n in self.nodes:
             for c in n.children:
@@ -132,7 +168,7 @@ class Datapath:
                 if kind == 'reg':
                     v.reg_reads.append(n.step)
         self.last_step = max([v.w for v in self.values.values()] + [n.step for n in self.nodes])
- 
+
     def _allocate_registers(self):
         """Left-edge: sort lifetimes by start, reuse the first register that is free."""
         need = sorted((v for v in self.values.values() if v.needs_reg),
@@ -150,12 +186,12 @@ class Datapath:
             v.reg = r
             reg_end[r] = v.end
             self.registers[r].append(v)
- 
+
     # ---- operand muxes ---------------------------------------------------
     def _signal(self, src):
         kind, x = src
         return f"r{x.reg}" if kind == 'reg' else x
- 
+
     def _bind_operands(self):
         """Per unit port, the list of distinct sources and which one each op selects.
         For commutative ops the operand order that adds fewer new mux inputs is chosen."""
@@ -175,7 +211,7 @@ class Datapath:
                 if s not in p:
                     p.append(s)
             self.issue.setdefault(n.step, []).append((u, sa, sb, n))
- 
+
     # ---- register writes -------------------------------------------------
     def _build_register_writes(self):
         self.reg_sources = [[] for _ in self.registers]
@@ -185,13 +221,17 @@ class Datapath:
                 if v.src not in self.reg_sources[r]:
                     self.reg_sources[r].append(v.src)
                 self.writes.setdefault(v.w, []).append((r, v.src, v))
+
+    # ======================================================================
+    #                               Verilog
+    # ======================================================================
     def verilog(self):
         W, T = self.width, self.last_step
         S_DONE = T + 1
         SW = clog2(S_DONE + 1)
         L = []
         emit = L.append
- 
+
         def mux(name, sources, sel):
             if len(sources) == 1:
                 emit(f"    wire [WIDTH-1:0] {name} = {sources[0]};")
@@ -204,19 +244,21 @@ class Datapath:
             emit(f"            default: {name} = {{WIDTH{{1'b0}}}};")
             emit(f"        endcase")
             emit(f"    end")
- 
+
         units = self.units()
         ports = ["    input  wire             clk,", "    input  wire             rst,",
+                 "    input  wire             ce,      // 1 = run; 0 = freeze everything",
                  "    input  wire             start,"]
         ports += [f"    input  wire [WIDTH-1:0] {v.src}," for v in self.inputs]
         ports += [f"    output wire [WIDTH-1:0] out_{ident(o)}," for o in self.outputs]
-        ports += ["    output wire             busy,", "    output wire             done,"]
-        ports += [f"    input wire [{clog2(len(units))}-1:0] function_probe_sel,"]
-        ports += [f"    output reg [WIDTH-1:0] function_probe"]
+        ports += [f"    output wire [WIDTH-1:0] dbg_{u}_out,   // debug: raw unit output" for u, _ in units]
+        ports += [f"    output wire [{SW-1}:0]       dbg_state,"]
+        ports += ["    output wire             busy,", "    output wire             done"]
+
         emit("// ---------------------------------------------------------------------------")
         emit(f"// {self.top}: auto-generated by datapath_gen.py -- do not edit by hand")
         emit("//")
-        emit("// Protocol: pulse `start` (1 cycle) with inputs valid; inputs are latched,")
+        emit("// Protocol: hold `start` for a cycle with ce=1 while idle; inputs are latched,")
         emit("// so they may change afterwards. Outputs are valid while `done` is high and")
         emit("// stay valid until the next `start`.")
         emit(f"// Latency: {S_DONE} cycles from the cycle `start` is sampled to `done`.")
@@ -231,7 +273,7 @@ class Datapath:
         for op, info in FU_TYPES.items():
             emit(f"    localparam LAT_{info['prefix'].upper()} = {self.latency[op]};")
         emit("")
- 
+
         # ---------------- FSM
         emit("    // ------------------------------------------------------------ FSM")
         emit(f"    localparam [{SW-1}:0] S_IDLE = {SW}'d0;")
@@ -239,7 +281,7 @@ class Datapath:
         emit(f"    reg [{SW-1}:0] state;")
         emit("    always @(posedge clk) begin")
         emit("        if (rst)                state <= S_IDLE;")
-        emit("        else case (state)")
+        emit("        else if (ce) case (state)")
         emit("            S_IDLE: if (start)  state <= 1;")
         emit("            S_DONE:             state <= S_IDLE;")
         emit("            default:            state <= state + 1'b1;   // control steps 1..%d" % T)
@@ -247,14 +289,9 @@ class Datapath:
         emit("    end")
         emit("    assign busy = (state != S_IDLE);")
         emit("    assign done = (state == S_DONE);")
+        emit("    assign dbg_state = state;")
         emit("")
-        
-        
-        for r, srcs in enumerate(self.reg_sources):
-            names = ", ".join(v.name for v in self.registers[r])
-            emit(f"    reg  [WIDTH-1:0] r{r};")
-            
-        
+
         # ---------------- control signal declarations
         emit("    // ------------------------------------------------------------ control signals")
         sels = []
@@ -304,7 +341,7 @@ class Datapath:
         emit("        endcase")
         emit("    end")
         emit("")
- 
+
         # ---------------- functional units + operand muxes
         emit("    // ------------------------------------------------------------ functional units")
         for u, op in units:
@@ -314,58 +351,30 @@ class Datapath:
             emit(f"    wire [WIDTH-1:0] {u}_out;")
             emit(f"    {info['module']} #(.WIDTH(WIDTH), .NUM_PIPE_CYCLES(LAT_{info['prefix'].upper()})) "
                  f"u_{u} (")
-            emit(f"        .clk(clk), .a({u}_a), .b({u}_b), .out({u}_out));")
+            emit(f"        .clk(clk), .ce(ce), .a({u}_a), .b({u}_b), .out({u}_out));")
+            emit(f"    assign dbg_{u}_out = {u}_out;")
             emit("")
-            
-        emit(f"    always @(*) begin")
-        emit(f"        case (function_probe)")
-        last = None
-        for index, (u, op) in enumerate(units):
-            emit(f"            {clog2(len(units))}'d{index}: function_probe = {u}_out;")
-            last = u
-        emit(f"            default: function_probe = {last}_out;")
-        emit(f"        endcase")
-        emit(f"    end")
-        
+
         # ---------------- registers
         emit("    // ------------------------------------------------------------ registers")
         for r, srcs in enumerate(self.reg_sources):
             names = ", ".join(v.name for v in self.registers[r])
             emit(f"    // r{r} holds: {names}")
             mux(f"r{r}_d", srcs, f"r{r}_sel")
-            #emit(f"    reg  [WIDTH-1:0] r{r};")
-            emit(f"    always @(posedge clk) if (r{r}_we) r{r} <= r{r}_d;")
+            emit(f"    reg  [WIDTH-1:0] r{r};")
+            emit(f"    always @(posedge clk) if (ce && r{r}_we) r{r} <= r{r}_d;")
             emit("")
- 
+
         emit("    // ------------------------------------------------------------ outputs")
         for o, n in self.outputs.items():
             emit(f"    assign out_{ident(o)} = r{self.values[id(n)].reg};   // {n.name}")
         emit("")
         emit("endmodule")
         return "\n".join(L) + "\n"
-    # ======================================================================
-    #                               Constraints
-    # ======================================================================
-    
-    def constraints(self,template):
-        with open(template) as f:
-            lines = f.readlines()
-        # We edit the IOs we need
-        for index,v in enumerate(self.inputs):
-            for j in range(self.width):
-                lines[index*self.width + j] = lines[index*self.width + j][1:]
-                lines[index*self.width + j] = lines[index*self.width + j].replace(f"SW[{index*self.width + j}]", f"{v.src}[{j}]")
-        for index,o in enumerate(self.outputs):
-            for j in range(self.width):
-                lines[16+index*self.width + j] = lines[16+index*self.width + j][1:]
-                lines[16+index*self.width + j] = lines[16+index*self.width + j].replace(f"LED[{index*self.width + j}]", f"out_{ident(o)}[{j}]")
-        # We write back
-        return "\n".join(lines)
+
     # ======================================================================
     #                               Testbench
     # ======================================================================
-    
-    #Claude helped with clean spacing and formatting, making RTL debugging of generated verilog cleaner and simpler.
     def testbench(self, algo, n_tests=200):
         """Reference model = the original program run sequentially, so it checks the
         parser/SSA/DCE as well as the scheduling and RTL."""
@@ -384,14 +393,15 @@ class Datapath:
         emit(f"module tb_{self.top};")
         emit(f"    localparam WIDTH = {W};")
         emit(f"    localparam N_TESTS = {n_tests};")
-        emit("    reg clk = 1'b0, rst = 1'b1, start = 1'b0;")
+        emit("    reg clk = 1'b0, rst = 1'b1, start = 1'b0, ce = 1'b1;")
+        emit("    reg random_ce = 1'b0;   // phase 2 stalls the datapath at random")
         for v in self.inputs:
             emit(f"    reg  [WIDTH-1:0] {v.src};")
         for o in self.outputs:
             emit(f"    wire [WIDTH-1:0] out_{ident(o)};")
         emit("    wire busy, done;")
         emit("")
-        conns = [".clk(clk)", ".rst(rst)", ".start(start)"]
+        conns = [".clk(clk)", ".rst(rst)", ".ce(ce)", ".start(start)"]
         conns += [f".{v.src}({v.src})" for v in self.inputs]
         conns += [f".out_{ident(o)}(out_{ident(o)})" for o in self.outputs]
         conns += [".busy(busy)", ".done(done)"]
@@ -399,6 +409,7 @@ class Datapath:
         emit("        " + ",\n        ".join(conns))
         emit("    );")
         emit("    always #5 clk = ~clk;")
+        emit("    always @(negedge clk) ce = random_ce ? $random : 1'b1;")
         emit("")
         emit("    // reference model: the original program, executed in order")
         emit("    reg [WIDTH-1:0] " + ", ".join(f"ref_{ident(n)}" for n in names) + ";")
@@ -419,12 +430,15 @@ class Datapath:
         emit("        randomize_inputs(0);")
         emit("        repeat (3) @(negedge clk);")
         emit("        rst = 1'b0;")
-        emit("        for (t = 0; t < N_TESTS; t = t + 1) begin")
+        emit("        for (t = 0; t < 2 * N_TESTS; t = t + 1) begin")
+        emit("            random_ce = (t >= N_TESTS);")
         emit("            @(negedge clk);")
         emit("            randomize_inputs(t < 2 ? t : 2);")
         emit("            run_reference;")
+        emit("            while (busy) @(negedge clk);    // previous run may still be stalled in DONE")
         emit("            start = 1'b1;")
         emit("            @(negedge clk);")
+        emit("            while (!busy) @(negedge clk);   // held until a ce cycle takes it")
         emit("            start = 1'b0;")
         emit("            randomize_inputs(2);          // inputs must have been latched")
         emit("            cycles = 1;")
@@ -436,18 +450,265 @@ class Datapath:
                  f"t, out_{ident(o)}, ref_{ident(o)});")
             emit("            end")
         emit("        end")
-        emit("        if (errors == 0) $display(\"PASS: %0d tests, %0d cycles start->done\", N_TESTS, cycles);")
+        emit("        if (errors == 0) $display(\"PASS: %0d tests (half with random ce stalls)\", 2 * N_TESTS);")
         emit("        else             $display(\"FAIL: %0d mismatches\", errors);")
         emit("        $finish;")
         emit("    end")
         emit("endmodule")
         return "\n".join(L) + "\n"
- 
+
+    # ======================================================================
+    #                    FPGA board wrapper (Nexys A7 style)
+    # ======================================================================
+    # Instantiates the user's modules -- debouncer #(COUNT), seven_seg -- it does not
+    # generate them. Port names match constraints.xdc.
+    def board_notes(self):
+        notes = []
+        if len(self.outputs) > 4:
+            notes.append(f"{len(self.outputs)} outputs but only 4 display digits: showing the "
+                         f"first 4 ({', '.join(list(self.outputs)[:4])}); use --outputs to choose")
+        if self.width > 4:
+            notes.append(f"WIDTH={self.width}: each digit shows only the low hex nibble")
+        return notes
+
+    def board_top(self):
+        W, S_DONE = self.width, self.last_step + 1
+        SW = clog2(S_DONE + 1)
+        units = [u for u, _ in self.units()]
+        PW = clog2(len(units))
+        shown = list(self.outputs)[:4]
+        digits = []                              # digit3 (leftmost) .. digit0
+        for i in range(4):
+            if i < len(shown):
+                o = f"out_{ident(shown[i])}"
+                digits.append(f"{o}[3:0]" if W >= 4 else f"{{{{{4 - W}{{1'b0}}}}, {o}}}")
+            else:
+                digits.append("4'h0")
+        L = []
+        emit = L.append
+        emit("`timescale 1ns/1ps")
+        emit("// ---------------------------------------------------------------------------")
+        emit(f"// {self.top}_fpga: board wrapper for {self.top} -- auto-generated by datapath_gen.py")
+        emit("//")
+        emit("//   start        button: run the computation (inputs are latched on the press)")
+        emit("//   step_switch  0 = run at full speed")
+        emit("//                1 = single-step: the start press executes cycle 1 (IDLE -> step 1,")
+        emit("//                    latching the inputs); each `step` press then executes exactly")
+        emit("//                    ONE more clock cycle of the whole datapath (FSM, registers and")
+        emit("//                    unit pipelines advance together), however long it is held")
+        emit("//   function_probe_sel  selects which unit output is shown on the leftmost digit: " +
+             ", ".join(f"{i}={u}" for i, u in enumerate(units)))
+        emit("//   display      digits 3..0 (left to right) = " +
+             ", ".join(shown) + "; leftmost digit = unit probe")
+        emit("//   busy LED     computation in progress   done LED  results valid (stays lit)")
+        emit("// ---------------------------------------------------------------------------")
+        emit(f"module {self.top}_fpga #(")
+        emit(f"    parameter WIDTH = {W},")
+        emit("    parameter DEBOUNCE_CYCLES = 32'd1_000_000     // ~10 ms at 100 MHz")
+        emit(")(")
+        ports = ["    input  wire             clk,", "    input  wire             rst,",
+                 "    input  wire             start,", "    input  wire             step,",
+                 "    input  wire             step_switch,"]
+        ports += [f"    input  wire [WIDTH-1:0] {v.src}," for v in self.inputs]
+        ports += ["    output wire [7:0]       an,", "    output wire [6:0]       cn,",
+                  "    output wire             busy,", "    output reg              done,",
+                  f"    input  wire [{PW-1}:0]       function_probe_sel"]
+        emit("\n".join(ports))
+        emit(");")
+        emit("")
+        emit("    // ---- 2-FF synchronizers: buttons and the mode switch are asynchronous to clk")
+        emit("    reg [1:0] start_sync, step_sync, mode_sync;")
+        emit("    always @(posedge clk) begin")
+        emit("        start_sync <= {start_sync[0], start};")
+        emit("        step_sync  <= {step_sync[0],  step};")
+        emit("        mode_sync  <= {mode_sync[0],  step_switch};")
+        emit("    end")
+        emit("    wire step_mode = mode_sync[1];")
+        emit("")
+        emit("    // ---- debounce, then turn each press into a ONE-cycle pulse")
+        emit("    wire start_db, step_db;")
+        emit("    debouncer #(.COUNT(DEBOUNCE_CYCLES)) u_start_db (")
+        emit("        .clk(clk), .rst(rst), .button(start_sync[1]), .debounced_button(start_db));")
+        emit("    debouncer #(.COUNT(DEBOUNCE_CYCLES)) u_step_db (")
+        emit("        .clk(clk), .rst(rst), .button(step_sync[1]),  .debounced_button(step_db));")
+        emit("    reg start_db_q, step_db_q;")
+        emit("    always @(posedge clk) begin")
+        emit("        if (rst) begin start_db_q <= 1'b0; step_db_q <= 1'b0; end")
+        emit("        else     begin start_db_q <= start_db; step_db_q <= step_db; end")
+        emit("    end")
+        emit("    wire start_pulse = start_db & ~start_db_q;")
+        emit("    wire step_pulse  = step_db  & ~step_db_q;")
+        emit("")
+        emit("    // ---- clock enable for the whole datapath")
+        emit("    wire core_busy, core_done;")
+        emit("    wire start_go = start_pulse & ~core_busy;          // accepted start")
+        emit("    wire ce = ~step_mode | step_pulse | start_go;")
+        emit("")
+        for o in self.outputs:
+            emit(f"    wire [WIDTH-1:0] out_{ident(o)};")
+        for u in units:
+            emit(f"    wire [WIDTH-1:0] dbg_{u}_out;")
+        emit(f"    wire [{SW-1}:0] dbg_state;")
+        conns = [".clk(clk)", ".rst(rst)", ".ce(ce)", ".start(start_go)"]
+        conns += [f".{v.src}({v.src})" for v in self.inputs]
+        conns += [f".out_{ident(o)}(out_{ident(o)})" for o in self.outputs]
+        conns += [f".dbg_{u}_out(dbg_{u}_out)" for u in units]
+        conns += [".dbg_state(dbg_state)", ".busy(core_busy)", ".done(core_done)"]
+        emit(f"    {self.top} #(.WIDTH(WIDTH)) u_core (")
+        emit("        " + ",\n        ".join(conns))
+        emit("    );")
+        emit("")
+        emit("    // ---- status LEDs: `done` stays lit until the next accepted start")
+        emit("    assign busy = core_busy;")
+        emit("    always @(posedge clk) begin")
+        emit("        if (rst || start_go)  done <= 1'b0;")
+        emit("        else if (core_done)   done <= 1'b1;")
+        emit("    end")
+        emit("")
+        emit("    // ---- unit probe for the leftmost digit")
+        emit("    reg [WIDTH-1:0] function_probe;")
+        emit("    always @(*) begin")
+        emit("        case (function_probe_sel)")
+        for i, u in enumerate(units):
+            emit(f"            {PW}'d{i}: function_probe = dbg_{u}_out;")
+        emit(f"            default: function_probe = dbg_{units[-1]}_out;")
+        emit("        endcase")
+        emit("    end")
+        emit("")
+        emit("    seven_seg u_display (")
+        emit("        .clk(clk), .rst(rst),")
+        emit(f"        .digit3({digits[0]}), .digit2({digits[1]}), "
+             f".digit1({digits[2]}), .digit0({digits[3]}),")
+        fp = "function_probe[3:0]" if W >= 4 else f"{{{{{4 - W}{{1'b0}}}}, function_probe}}"
+        emit(f"        .digit_function({fp}),")
+        emit("        .an(an), .seg(cn));")
+        emit("")
+        emit("endmodule")
+        return "\n".join(L) + "\n"
+
+    def board_testbench(self, algo, n_tests=20, debounce=20):
+        """Presses the (bouncing) buttons like a person would, in both modes, with a short
+        debounce so it simulates quickly. Checks results, the done LED, and that each step
+        press advances exactly one cycle no matter how long it is held."""
+        W, S_DONE = self.width, self.last_step + 1
+        top = f"{self.top}_fpga"
+        names = []
+        for out, a, _, b in algo:
+            for x in (a, b, out):
+                if not is_const(x) and x not in names:
+                    names.append(x)
+        ref = lambda x: (f"{W}'d{x}" if is_const(x) else f"ref_{ident(x)}")
+        rand = "{" + ", ".join(["$random"] * math.ceil(W / 32)) + "}"
+        PW = clog2(len(self.units()))
+        L = []
+        emit = L.append
+        emit("`timescale 1ns/1ps")
+        emit(f"// Board-level testbench for {top} (auto-generated)")
+        emit(f"module tb_{top};")
+        emit(f"    localparam WIDTH = {W}, DB = {debounce}, S_DONE = {S_DONE}, N_TESTS = {n_tests};")
+        emit("    reg clk = 1'b0, rst = 1'b1, start = 1'b0, step = 1'b0, step_switch = 1'b0;")
+        for v in self.inputs:
+            emit(f"    reg  [WIDTH-1:0] {v.src} = 0;")
+        emit(f"    reg  [{PW-1}:0] function_probe_sel = 0;")
+        emit("    wire [7:0] an; wire [6:0] cn; wire busy, done;")
+        conns = [".clk(clk)", ".rst(rst)", ".start(start)", ".step(step)", ".step_switch(step_switch)"]
+        conns += [f".{v.src}({v.src})" for v in self.inputs]
+        conns += [".an(an)", ".cn(cn)", ".busy(busy)", ".done(done)",
+                  ".function_probe_sel(function_probe_sel)"]
+        emit(f"    {top} #(.WIDTH(WIDTH), .DEBOUNCE_CYCLES(DB)) dut (")
+        emit("        " + ",\n        ".join(conns))
+        emit("    );")
+        emit("    always #5 clk = ~clk;")
+        emit("    // seven_seg's digit counter runs on the divided clock, which does not tick during")
+        emit("    // reset, so in simulation it starts at x (FPGA flops power up at 0 -- hardware is fine)")
+        emit("    initial dut.u_display.anode_counter.count = 3'd0;")
+        emit("")
+        emit("    reg [WIDTH-1:0] " + ", ".join(f"ref_{ident(n)}" for n in names) + ";")
+        emit("    task run_reference; begin")
+        for v in self.inputs:
+            emit(f"        ref_{ident(v.name)} = {v.src};")
+        for out, a, op, b in algo:
+            emit(f"        {ref(out)} = {ref(a)} {op} {ref(b)};")
+        emit("    end endtask")
+        emit("    task set_switches; begin")
+        for v in self.inputs:
+            emit(f"        {v.src} = {rand};")
+        emit("    end endtask")
+        emit("")
+        emit("    // a press: a few bounces, held for `hold` cycles, a few bounces on release")
+        emit("    task press(input integer which, input integer hold); integer k; begin")
+        emit("        for (k = 0; k < 3; k = k + 1) begin")
+        emit("            if (which) step = 1; else start = 1; repeat (3) @(negedge clk);")
+        emit("            if (which) step = 0; else start = 0; repeat (2) @(negedge clk);")
+        emit("        end")
+        emit("        if (which) step = 1; else start = 1;")
+        emit("        repeat (hold) @(negedge clk);")
+        emit("        for (k = 0; k < 2; k = k + 1) begin")
+        emit("            if (which) step = 0; else start = 0; repeat (2) @(negedge clk);")
+        emit("            if (which) step = 1; else start = 1; repeat (2) @(negedge clk);")
+        emit("        end")
+        emit("        if (which) step = 0; else start = 0;")
+        emit("        repeat (DB * 3) @(negedge clk);")
+        emit("    end endtask")
+        emit("")
+        emit("    integer t, k, errors = 0;")
+        emit("    task check_outputs(input integer t); begin")
+        for o in self.outputs:
+            emit(f"        if (dut.out_{ident(o)} !== ref_{ident(o)}) begin errors = errors + 1;")
+            emit(f"            $display(\"MISMATCH test %0d: {o} = %0d, expected %0d\", t, "
+                 f"dut.out_{ident(o)}, ref_{ident(o)}); end")
+        emit("        if (done !== 1'b1) begin errors = errors + 1;")
+        emit("            $display(\"test %0d: done LED not lit\", t); end")
+        emit("    end endtask")
+        emit("    task expect_state(input integer s, input integer t); begin")
+        emit("        if (dut.dbg_state !== s) begin errors = errors + 1;")
+        emit("            $display(\"test %0d: state = %0d, expected %0d\", t, dut.dbg_state, s); end")
+        emit("    end endtask")
+        emit("")
+        emit("    initial begin")
+        emit("        repeat (5) @(negedge clk); rst = 0; repeat (5) @(negedge clk);")
+        emit("        // ---------------- run mode: long press, results must survive the release")
+        emit("        for (t = 0; t < N_TESTS; t = t + 1) begin")
+        emit("            set_switches; run_reference;")
+        emit("            press(0, DB * 10);")
+        emit("            set_switches;                    // must not disturb latched inputs")
+        emit("            repeat (DB * 5) @(negedge clk);")
+        emit("            check_outputs(t);")
+        emit("        end")
+        emit("        // ---------------- step mode")
+        emit("        step_switch = 1; repeat (10) @(negedge clk);")
+        emit("        for (t = N_TESTS; t < 2 * N_TESTS; t = t + 1) begin")
+        emit("            set_switches; run_reference;")
+        emit("            repeat (DB * 5) @(negedge clk);")
+        emit("            expect_state(0, t);               // nothing moves without a press")
+        emit("            press(0, DB * 4);")
+        emit("            set_switches;")
+        emit("            expect_state(1, t);               // start = cycle 1, inputs latched")
+        emit("            for (k = 2; k <= S_DONE; k = k + 1) begin")
+        emit("                press(1, DB * (k == 2 ? 40 : 4));   // one very long hold included")
+        emit("                expect_state(k, t);")
+        emit("                if (k < S_DONE && done) begin errors = errors + 1;")
+        emit("                    $display(\"test %0d: done LED early\", t); end")
+        emit("            end")
+        emit("            check_outputs(t);")
+        emit("            press(1, DB * 4);                 // DONE -> IDLE")
+        emit("            expect_state(0, t);")
+        emit("            check_outputs(t);                 // results still shown afterwards")
+        emit("        end")
+        emit("        // ---------------- back to run mode")
+        emit("        step_switch = 0; repeat (10) @(negedge clk);")
+        emit("        set_switches; run_reference; press(0, DB * 4);")
+        emit("        repeat (DB * 2) @(negedge clk); check_outputs(2 * N_TESTS);")
+        emit("        if (errors == 0) $display(\"PASS: %0d run-mode + %0d step-mode tests\", N_TESTS + 1, N_TESTS);")
+        emit("        else             $display(\"FAIL: %0d errors\", errors);")
+        emit("        $finish;")
+        emit("    end")
+        emit("endmodule")
+        return "\n".join(L) + "\n"
+
     # ======================================================================
     #                               Report
     # ======================================================================
-    
-    #Claude helped with the report visualizations.
     def report(self, removed=()):
         T = self.last_step
         out = [f"Datapath report: {self.top}", "=" * 60, ""]
@@ -497,11 +758,11 @@ class Datapath:
             out.append(f"  {s:>4} | " + " | ".join(f"{busy[u]:^5}" for u, _ in self.units())
                        + f" | {wr}")
         return "\n".join(out) + "\n"
- 
- 
+
+
 def _children_names(self):
     nm = lambda c: c.name if isinstance(c, Node) else c
     return f"{nm(self.children[0])} {self.op} {nm(self.children[1])}"
- 
- 
+
+
 Node.children_names = _children_names
