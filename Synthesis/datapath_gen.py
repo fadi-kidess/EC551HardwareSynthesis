@@ -210,7 +210,7 @@ class Datapath:
                  "    input  wire             start,"]
         ports += [f"    input  wire [WIDTH-1:0] {v.src}," for v in self.inputs]
         ports += [f"    output wire [WIDTH-1:0] out_{ident(o)}," for o in self.outputs]
-        ports += ["    output wire             busy,", "    output wire             done"]
+        ports += ["    output wire             busy,", "    output wire             done,"]
         ports += [f"    input wire [{clog2(len(units))}-1:0] function_probe_sel,"]
         ports += [f"    output reg [WIDTH-1:0] function_probe"]
         emit("// ---------------------------------------------------------------------------")
@@ -248,7 +248,13 @@ class Datapath:
         emit("    assign busy = (state != S_IDLE);")
         emit("    assign done = (state == S_DONE);")
         emit("")
- 
+        
+        
+        for r, srcs in enumerate(self.reg_sources):
+            names = ", ".join(v.name for v in self.registers[r])
+            emit(f"    reg  [WIDTH-1:0] r{r};")
+            
+        
         # ---------------- control signal declarations
         emit("    // ------------------------------------------------------------ control signals")
         sels = []
@@ -327,7 +333,7 @@ class Datapath:
             names = ", ".join(v.name for v in self.registers[r])
             emit(f"    // r{r} holds: {names}")
             mux(f"r{r}_d", srcs, f"r{r}_sel")
-            emit(f"    reg  [WIDTH-1:0] r{r};")
+            #emit(f"    reg  [WIDTH-1:0] r{r};")
             emit(f"    always @(posedge clk) if (r{r}_we) r{r} <= r{r}_d;")
             emit("")
  

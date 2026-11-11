@@ -21,7 +21,7 @@ module input_1_datapath #(
     output wire [WIDTH-1:0] out_Y,
     output wire [WIDTH-1:0] out_X,
     output wire             busy,
-    output wire             done
+    output wire             done,
     input wire [2-1:0] function_probe_sel,
     output reg [WIDTH-1:0] function_probe
 );
@@ -45,6 +45,10 @@ module input_1_datapath #(
     assign busy = (state != S_IDLE);
     assign done = (state == S_DONE);
 
+    reg  [WIDTH-1:0] r0;
+    reg  [WIDTH-1:0] r1;
+    reg  [WIDTH-1:0] r2;
+    reg  [WIDTH-1:0] r3;
     // ------------------------------------------------------------ control signals
     reg r0_we;
     reg r1_we;
@@ -144,7 +148,6 @@ module input_1_datapath #(
             default: r0_d = {WIDTH{1'b0}};
         endcase
     end
-    reg  [WIDTH-1:0] r0;
     always @(posedge clk) if (r0_we) r0 <= r0_d;
 
     // r1 holds: A, Y
@@ -156,7 +159,6 @@ module input_1_datapath #(
             default: r1_d = {WIDTH{1'b0}};
         endcase
     end
-    reg  [WIDTH-1:0] r1;
     always @(posedge clk) if (r1_we) r1 <= r1_d;
 
     // r2 holds: B, Z
@@ -168,12 +170,10 @@ module input_1_datapath #(
             default: r2_d = {WIDTH{1'b0}};
         endcase
     end
-    reg  [WIDTH-1:0] r2;
     always @(posedge clk) if (r2_we) r2 <= r2_d;
 
     // r3 holds: Q
     wire [WIDTH-1:0] r3_d = mul0_out;
-    reg  [WIDTH-1:0] r3;
     always @(posedge clk) if (r3_we) r3 <= r3_d;
 
     // ------------------------------------------------------------ outputs
