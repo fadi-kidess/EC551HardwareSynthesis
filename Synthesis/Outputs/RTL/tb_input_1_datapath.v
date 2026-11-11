@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 // Self-checking testbench for input_1_datapath (auto-generated)
 module tb_input_1_datapath;
-    localparam WIDTH = 32;
+    localparam WIDTH = 4;
     localparam N_TESTS = 200;
     reg clk = 1'b0, rst = 1'b1, start = 1'b0;
     reg  [WIDTH-1:0] in_A;

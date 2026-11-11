@@ -8,7 +8,7 @@
 // ---------------------------------------------------------------------------
 `timescale 1ns/1ps
 module input_1_datapath #(
-    parameter WIDTH = 32
+    parameter WIDTH = 4
 )(
     input  wire             clk,
     input  wire             rst,
@@ -23,7 +23,7 @@ module input_1_datapath #(
     output wire             busy,
     output wire             done
     input wire [2-1:0] function_probe_sel,
-    output wire [WIDTH-1:0] function_probe
+    output reg [WIDTH-1:0] function_probe
 );
 
     localparam LAT_ADD = 1;

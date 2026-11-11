@@ -337,7 +337,24 @@ class Datapath:
         emit("")
         emit("endmodule")
         return "\n".join(L) + "\n"
- 
+    # ======================================================================
+    #                               Constraints
+    # ======================================================================
+    
+    def constraints(self,template):
+        with open(template) as f:
+            lines = f.readlines()
+        # We edit the IOs we need
+        for index,v in enumerate(self.inputs):
+            for j in range(self.width):
+                lines[index*self.width + j] = lines[index*self.width + j][1:]
+                lines[index*self.width + j] = lines[index*self.width + j].replace(f"SW[{index*self.width + j}]", f"{v.src}[{j}]")
+        for index,o in enumerate(self.outputs):
+            for j in range(self.width):
+                lines[16+index*self.width + j] = lines[16+index*self.width + j][1:]
+                lines[16+index*self.width + j] = lines[16+index*self.width + j].replace(f"LED[{index*self.width + j}]", f"out_{ident(o)}[{j}]")
+        # We write back
+        return "\n".join(lines)
     # ======================================================================
     #                               Testbench
     # ======================================================================

@@ -71,6 +71,7 @@ try:
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / f"{top}.v").write_text(dp.verilog())
         (out_dir / f"tb_{top}.v").write_text(dp.testbench(algo))
+        (out_dir / f"constraints.xdc").write_text(dp.constraints("nexys.xdc"))
         report = dp.report(removed)
         (out_dir / f"{top}_report.txt").write_text(report)
         print("\n************RTL*****************\n")
